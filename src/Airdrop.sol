@@ -190,7 +190,7 @@ contract Airdrop is Ownable, ReentrancyGuard {
 
         uint256 totalAmount = airdropAmount; // Total = full airdrop amount (half staking amount + half reward amount)
 
-        hasUnstaked[msg.sender] = true; 
+        hasUnstaked[msg.sender] = true;
         SafeERC20.safeTransfer(IERC20(token), msg.sender, totalAmount);
         emit Unstaked(msg.sender, totalAmount);
     }
