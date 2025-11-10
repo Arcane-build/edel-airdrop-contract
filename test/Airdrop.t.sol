@@ -47,18 +47,18 @@ contract AirdropTest is Test {
         assertEq(airdrop.hasClaimed(user), false);
 
         vm.prank(user);
-        airdrop.claim();
+        airdrop.claim(false); // User doesn't want to stake
         assertEq(airdrop.hasClaimed(user), true);
-        assertEq(testERC20.balanceOf(user), 10_000 * 10 ** 18);
+        assertEq(testERC20.balanceOf(user), 5_000 * 10 ** 18); // Half amount
     }
 
     function test_claimAgain() public {
         address user = getAddressAtIndex(0);
         vm.prank(user);
-        airdrop.claim();
+        airdrop.claim(false);
         vm.expectRevert(Airdrop.AlreadyClaimed.selector);
         vm.prank(user);
-        airdrop.claim();
+        airdrop.claim(false);
     }
 
     function test_claimNotEligibaleForClaim() public {
@@ -66,7 +66,7 @@ contract AirdropTest is Test {
         assertEq(airdrop.isEligibaleForClaim(randomAddress), false);
         vm.expectRevert(Airdrop.NotEligibaleForClaim.selector);
         vm.prank(randomAddress);
-        airdrop.claim();
+        airdrop.claim(false);
     }
 
     function testClaimAll() public {
@@ -78,94 +78,137 @@ contract AirdropTest is Test {
             assertEq(airdrop.hasClaimed(addresses[i]), false);
 
             vm.prank(addresses[i]);
-            airdrop.claim();
+            airdrop.claim(false); // Users don't want to stake
 
             assertEq(airdrop.hasClaimed(addresses[i]), true);
-            assertEq(testERC20.balanceOf(addresses[i]), 10_000 * 10 ** 18);
+            assertEq(testERC20.balanceOf(addresses[i]), 5_000 * 10 ** 18); // Half amount
 
             vm.expectRevert(Airdrop.AlreadyClaimed.selector);
             vm.prank(addresses[i]);
-            airdrop.claim();
+            airdrop.claim(false);
         }
-        assertEq(testERC20.balanceOf(address(airdrop)), 3_000_000 * 10 ** 18);
+        // After 500 users claim half, contract should have: 8_000_000 - (500 * 5_000) = 5_500_000
+        assertEq(testERC20.balanceOf(address(airdrop)), 5_500_000 * 10 ** 18);
     }
 
-    function test_claimHalfAndStake() public {
+    function test_claimAndStake() public {
         address user = getAddressAtIndex(0);
         assertEq(airdrop.totalUserStaked(), 0);
         uint256 halfAmount = airdrop.airdropAmount() / 2;
 
         vm.warp(1_000);
         vm.prank(user);
-        airdrop.claimHalfAndStake();
+        airdrop.claim(true); // User wants to stake
+        assertEq(airdrop.hasClaimed(user), true);
+        assertEq(airdrop.wantsToStake(user), true);
+        assertEq(testERC20.balanceOf(user), halfAmount);
+
+        vm.prank(user);
+        airdrop.stake();
 
         assertEq(airdrop.hasStaked(user), true);
-        assertEq(airdrop.hasClaimed(user), false);
         assertEq(airdrop.totalUserStaked(), 1);
-        assertEq(testERC20.balanceOf(user), halfAmount);
+        assertEq(airdrop.totalTokensStaked(), halfAmount);
         assertEq(airdrop.stakingUnlockTime(user), 1_000 + 1 days);
 
         vm.expectRevert(Airdrop.AlreadyStaked.selector);
         vm.prank(user);
-        airdrop.claimHalfAndStake();
+        airdrop.stake();
     }
 
-    function test_claimHalfAndStakeNotEligible() public {
+    function test_stakeWithoutClaimingReverts() public {
         address randomAddress = address(123456);
-        vm.expectRevert(Airdrop.NotEligibaleForClaim.selector);
+        vm.expectRevert(Airdrop.NotClaimed.selector);
         vm.prank(randomAddress);
-        airdrop.claimHalfAndStake();
+        airdrop.stake();
     }
 
-    function test_claimStakeRewardsSuccess() public {
+    function test_stakeWithoutWantingToStakeReverts() public {
+        address user = getAddressAtIndex(0);
+        vm.prank(user);
+        airdrop.claim(false); // User doesn't want to stake
+
+        vm.expectRevert(Airdrop.DoesNotWantToStake.selector);
+        vm.prank(user);
+        airdrop.stake();
+    }
+
+    function test_unstakeSuccess() public {
         address user = getAddressAtIndex(1);
         uint256 halfAmount = airdrop.airdropAmount() / 2;
-        uint256 expectedTotal = airdrop.airdropAmount() + halfAmount;
+        // User receives half from claim, then full airdrop from unstake (half staked + half rewards)
+        uint256 expectedTotal = halfAmount + airdrop.airdropAmount(); // 1.5x airdrop amount
 
         vm.warp(5_000);
         vm.prank(user);
-        airdrop.claimHalfAndStake();
+        airdrop.claim(true); // User wants to stake
         assertEq(testERC20.balanceOf(user), halfAmount);
+
+        vm.prank(user);
+        airdrop.stake();
+        assertEq(airdrop.totalTokensStaked(), halfAmount);
 
         vm.warp(5_000 + 1 days + 1);
         vm.prank(user);
-        airdrop.claimStakeRewards();
+        airdrop.unstake();
 
-        assertEq(airdrop.hasClaimed(user), true);
-        assertEq(testERC20.balanceOf(user), expectedTotal);
+        assertEq(airdrop.hasUnstaked(user), true);
+        assertEq(testERC20.balanceOf(user), expectedTotal); // Half from claim + full from unstake
     }
 
-    function test_claimStakeRewardsBeforeUnlockReverts() public {
+    function test_unstakeBeforeUnlockReverts() public {
         address user = getAddressAtIndex(2);
 
         vm.prank(user);
-        airdrop.claimHalfAndStake();
-
-        vm.expectRevert(Airdrop.CanNotClaimNow.selector);
+        airdrop.claim(true);
         vm.prank(user);
-        airdrop.claimStakeRewards();
+        airdrop.stake();
+
+        vm.expectRevert(Airdrop.CanNotUnstakeNow.selector);
+        vm.prank(user);
+        airdrop.unstake();
     }
 
-    function test_claimStakeRewardsWithoutStakeReverts() public {
+    function test_unstakeWithoutStakeReverts() public {
         address randomAddress = address(999_999);
         vm.expectRevert(Airdrop.NotStaked.selector);
         vm.prank(randomAddress);
-        airdrop.claimStakeRewards();
+        airdrop.unstake();
     }
 
-    function test_claimStakeRewardsAfterClaimReverts() public {
+    function test_unstakeMultipleTimesReverts() public {
         address user = getAddressAtIndex(3);
+        uint256 halfAmount = airdrop.airdropAmount() / 2;
+        uint256 initialBalance = testERC20.balanceOf(user);
+
+        vm.warp(10_000);
+        vm.prank(user);
+        airdrop.claim(true); // User wants to stake
+        assertEq(testERC20.balanceOf(user), initialBalance + halfAmount);
 
         vm.prank(user);
-        airdrop.claimHalfAndStake();
+        airdrop.stake();
+        assertEq(airdrop.totalTokensStaked(), halfAmount);
 
-        vm.warp(block.timestamp + 1 days + 1);
+        vm.warp(10_000 + 1 days + 1);
         vm.prank(user);
-        airdrop.claimStakeRewards();
+        airdrop.unstake();
 
-        vm.expectRevert(Airdrop.AlreadyClaimed.selector);
+        uint256 balanceAfterFirstUnstake = testERC20.balanceOf(user);
+        assertEq(airdrop.hasUnstaked(user), true); // Should be set to true after unstaking
+
+        // Try to unstake again - should revert
+        vm.expectRevert(Airdrop.AlreadyUnstaked.selector);
         vm.prank(user);
-        airdrop.claimStakeRewards();
+        airdrop.unstake();
+
+        // Try to stake again - should revert because hasUnstaked is true
+        vm.expectRevert(Airdrop.AlreadyUnstaked.selector);
+        vm.prank(user);
+        airdrop.stake();
+
+        // Verify balance hasn't changed
+        assertEq(testERC20.balanceOf(user), balanceAfterFirstUnstake);
     }
 
     function test_withdrawByOwner() public {

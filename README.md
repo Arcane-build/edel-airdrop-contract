@@ -2,26 +2,26 @@
 
 ## Overview
 
-The `Airdrop` contract is an ERC20 token distribution system that allows eligible addresses to claim a fixed amount of tokens. It provides two claiming mechanisms: immediate full claim or a claim-and-stake option where users can claim half immediately and stake the remaining half for rewards.
+The `Airdrop` contract distributes a fixed ERC20 allocation to addresses that the owner marks as eligible. Eligible users can claim half of their allocation immediately and decide whether to stake the remaining half to earn an additional reward after a 24-hour lock. The contract also tracks participation statistics and separates users by staking preference.
 
 ## Features
 
-- **Fixed Amount Airdrop**: Each eligible address can claim a fixed, predetermined amount of tokens
-- **Dual Claim Options**:
-  - **Immediate Claim**: Claim the full airdrop amount instantly
-  - **Claim and Stake**: Claim half immediately and stake the remaining half for 1 day to receive 1.5x rewards
-- **Owner Controls**: Contract owner can manage eligibility and perform emergency withdrawals
-- **Safe Token Transfers**: Uses OpenZeppelin's SafeERC20 for secure token transfers
+- **Fixed Allotment**: Each eligible user receives the same `airdropAmount`.
+- **Flexible Claiming**: Users claim half up front and optionally opt into staking the remaining half during the claim.
+- **Staking Rewards**: Opted-in users lock the remaining half for 24 hours and withdraw the full `airdropAmount` (principal + reward) once unlocked.
+- **Participation Tracking**: The contract records which users claimed, staked, unstaked, and keeps per-group address lists.
+- **Owner Controls**: The owner can batch-enable eligibility and withdraw any ERC20 tokens from the contract.
+- **Safe Transfers & Guards**: Uses OpenZeppelin `SafeERC20`, `Ownable`, and `ReentrancyGuard`.
 
 ## Contract Details
 
 - **License**: MIT
 - **Solidity Version**: ^0.8.0
-- **Inherits**: `Ownable` from OpenZeppelin
-- **Dependencies**: 
-  - OpenZeppelin `Ownable`
-  - OpenZeppelin `SafeERC20`
-  - OpenZeppelin `IERC20`
+- **Imports**:
+  - `Ownable`
+  - `ReentrancyGuard`
+  - `SafeERC20`
+  - `IERC20`
 
 ## State Variables
 
@@ -29,24 +29,31 @@ The `Airdrop` contract is an ERC20 token distribution system that allows eligibl
 
 | Variable | Type | Description |
 |----------|------|-------------|
-| `token` | `address` | The ERC20 token address that will be distributed |
-| `airdropAmount` | `uint256` | Fixed amount of tokens each eligible address can claim |
-| `totalUserStaked` | `uint256` | Total number of users who have opted into the staking flow |
+| `token` | `address` | ERC20 token distributed by the airdrop |
+| `airdropAmount` | `uint256` | Fixed allocation per eligible claimer |
+| `totalUserStaked` | `uint256` | Count of users who have ever staked |
+| `totalTokensStaked` | `uint256` | Cumulative tokens locked via staking |
+| `stakedUsers` | `address[]` | Addresses that opted into staking |
+| `nonStakedUsers` | `address[]` | Addresses that skipped staking |
 
 ### Private Constants
 
 | Variable | Type | Value | Description |
 |----------|------|-------|-------------|
-| `STAKING_DURATION` | `uint256` | `1 days` | Duration users must wait before claiming staking rewards |
+| `STAKING_DURATION` | `uint256` | `1 days` | Lock period before unstaking |
 
 ### Mappings
 
 | Mapping | Type | Description |
 |---------|------|-------------|
-| `stakingUnlockTime` | `mapping(address => uint256)` | Tracks when each address can claim their staked rewards |
-| `hasStaked` | `mapping(address => bool)` | Tracks whether an address has staked tokens |
-| `isEligibaleForClaim` | `mapping(address => bool)` | Tracks whether an address is eligible to claim |
-| `hasClaimed` | `mapping(address => bool)` | Tracks whether an address has already claimed |
+| `stakingUnlockTime` | `mapping(address => uint256)` | Unlock timestamp for stakers |
+| `hasStaked` | `mapping(address => bool)` | Whether the address called `stake()` |
+| `hasUnstaked` | `mapping(address => bool)` | Whether the address already withdrew |
+| `wantsToStake` | `mapping(address => bool)` | User's staking preference set during `claim()` |
+| `isEligibaleForClaim` | `mapping(address => bool)` | Eligibility flag (note spelling matches contract) |
+| `hasClaimed` | `mapping(address => bool)` | Claim status |
+| `isInStakedList` | `mapping(address => bool)` | Prevents duplicates in `stakedUsers` array |
+| `isInNonStakedList` | `mapping(address => bool)` | Prevents duplicates in `nonStakedUsers` array |
 
 ## Functions
 
@@ -56,258 +63,138 @@ The `Airdrop` contract is an ERC20 token distribution system that allows eligibl
 constructor(address _token, uint256 _airdropAmount) Ownable(msg.sender)
 ```
 
-**Description**: Initializes the airdrop contract with the token address and fixed claim amount.
-
-**Parameters**:
-- `_token` (address): The ERC20 token address to distribute
-- `_airdropAmount` (uint256): The fixed number of tokens sent per claim
-
-**Requirements**:
-- None
-
-**Effects**:
-- Sets the contract owner to the deployer
-- Sets the token address
-- Sets the airdrop amount
+Initializes the token and the per-user allocation. Reverts if `_token` is the zero address or `_airdropAmount` is zero.
 
 ---
 
-### `claim()`
+### `claim(bool _wantsToStake)`
 
 ```solidity
-function claim() public
+function claim(bool _wantsToStake) public nonReentrant
 ```
 
-**Description**: Allows eligible addresses to claim the full airdrop amount immediately.
+Eligible users call `claim` to receive half of their allocation immediately. They simultaneously signal whether they intend to stake the remaining half.
 
-**Parameters**: None
-
-**Requirements**:
-- Caller must be eligible (`isEligibaleForClaim[msg.sender] == true`)
-- Caller must not have already claimed (`hasClaimed[msg.sender] == false`)
-- Caller must not have staked (`hasStaked[msg.sender] == false`)
-
-**Effects**:
-- Marks the caller as claimed (`hasClaimed[msg.sender] = true`)
-- Transfers `airdropAmount` tokens to the caller
-- Emits `AirdropClaimed` event
-
-**Reverts**:
-- `NotEligibaleForClaim()`: If caller is not eligible
-- `AlreadyClaimed()`: If caller has already claimed
-- `AlreadyStaked()`: If caller has already staked
-
-**Events**:
-- `AirdropClaimed(address indexed user, uint256 amount)`
+- **Requirements**
+  - Caller is eligible and has not claimed before.
+- **Effects**
+  - Stores the caller's staking preference in `wantsToStake`.
+  - Sends `airdropAmount / 2` tokens to the caller.
+  - Adds the caller to `nonStakedUsers` if `_wantsToStake` is false.
+  - Emits `AirdropClaimed`.
+- **Reverts**
+  - `NotEligibaleForClaim()` if not whitelisted.
+  - `AlreadyClaimed()` if the caller already claimed.
 
 ---
 
-### `claimHalfAndStake()`
+### `stake()`
 
 ```solidity
-function claimHalfAndStake() public
+function stake() public nonReentrant
 ```
 
-**Description**: Claims half of the airdrop immediately and stakes the remaining half for a fixed duration (1 day). After the staking period, users can claim the staked portion plus rewards (total of full airdrop amount).
+Allows a claimer who opted into staking to start the staking period after their claim.
 
-**Parameters**: None
-
-**Requirements**:
-- Caller must be eligible (`isEligibaleForClaim[msg.sender] == true`)
-- Caller must not have already claimed (`hasClaimed[msg.sender] == false`)
-- Caller must not have already staked (`hasStaked[msg.sender] == false`)
-- Caller must not have an active staking period (`stakingUnlockTime[msg.sender] == 0`)
-
-**Effects**:
-- Transfers `airdropAmount / 2` tokens immediately to the caller
-- Marks the caller as staked (`hasStaked[msg.sender] = true`)
-- Increments `totalUserStaked`
-- Sets `stakingUnlockTime[msg.sender] = block.timestamp + 1 days`
-- Emits `AirdropClaimAndStake` event
-
-**Reverts**:
-- `NotEligibaleForClaim()`: If caller is not eligible
-- `AlreadyClaimed()`: If caller has already claimed
-- `AlreadyStaked()`: If caller has already staked or has an active staking period
-
-**Events**:
-- `AirdropClaimAndStake(address indexed user, uint256 claimAMount, uint256 stakeAmount)`
-
-**Note**: The staked amount is `airdropAmount - (airdropAmount / 2)`, which equals half the airdrop amount.
+- **Requirements**
+  - Caller claimed, opted into staking, has not already staked, and has not unstaked.
+- **Effects**
+  - Marks the caller as staked, updates totals, sets a 24-hour unlock timestamp, and records the address in `stakedUsers`.
+  - Emits `Staked`.
+- **Reverts**
+  - `NotClaimed()`, `DoesNotWantToStake()`, `AlreadyStaked()`, or `AlreadyUnstaked()` as appropriate.
 
 ---
 
-### `claimStakeRewards()`
+### `unstake()`
 
 ```solidity
-function claimStakeRewards() public
+function unstake() public nonReentrant
 ```
 
-**Description**: Claims the staked portion of the airdrop after the staking duration has elapsed. Users receive the full airdrop amount (the remaining half plus rewards equal to half the airdrop amount).
+Lets a staker withdraw the locked half plus rewards (totaling `airdropAmount`) after the lock expires.
 
-**Parameters**: None
-
-**Requirements**:
-- Caller must not have already claimed (`hasClaimed[msg.sender] == false`)
-- Caller must have staked (`hasStaked[msg.sender] == true`)
-- Staking unlock time must have passed (`stakingUnlockTime[msg.sender] <= block.timestamp`)
-
-**Effects**:
-- Marks the caller as claimed (`hasClaimed[msg.sender] = true`)
-- Transfers `airdropAmount` tokens to the caller (remaining half + reward)
-- Emits `AirdropClaimed` event
-
-**Reverts**:
-- `AlreadyClaimed()`: If caller has already claimed
-- `NotStaked()`: If caller never staked
-- `CanNotClaimNow()`: If staking unlock time has not yet passed
-
-**Events**:
-- `AirdropClaimed(address indexed user, uint256 amount)`
-
-**Reward Calculation**: 
-- User receives `airdropAmount` total (the staked half + reward equal to half)
-- Effective reward: 100% APY for 1 day staking period
+- **Requirements**
+  - Caller staked, has not already unstaked, and the unlock timestamp has passed.
+- **Effects**
+  - Transfers `airdropAmount` tokens to the caller (return of principal and reward).
+  - Marks the caller as unstaked.
+  - Emits `Unstaked`.
+- **Reverts**
+  - `NotStaked()`, `AlreadyUnstaked()`, or `CanNotUnstakeNow()`.
 
 ---
 
-### `setEligibaleForClaim()`
+### `setEligibaleForClaim(address[] calldata _addresses)`
 
 ```solidity
 function setEligibaleForClaim(address[] calldata _addresses) public onlyOwner
 ```
 
-**Description**: Batch-updates claim eligibility for a list of addresses. Only the contract owner can call this function.
-
-**Parameters**:
-- `_addresses` (address[]): Array of addresses to mark as eligible for claiming
-
-**Requirements**:
-- Caller must be the contract owner
-- None (addresses can be set as eligible multiple times without error)
-
-**Effects**:
-- Sets `isEligibaleForClaim[_addresses[i]] = true` for each address in the array
-
-**Reverts**:
-- Reverts if caller is not the owner (via `onlyOwner` modifier)
+Owner-only batch method to toggle eligibility for incoming addresses. Reverts with `ZeroAddress()` if any input is the zero address.
 
 ---
+
+### `getStakedUsers()` / `getNonStakedUsers()` / `getStakedUsersCount()` / `getNonStakedUsersCount()`
+
+View helpers that return the respective address arrays and counts.
+
+---
+
+### `withdraw(address _token, uint256 _amount)`
+
+```solidity
+function withdraw(address _token, uint256 _amount) public onlyOwner
+```
+
+Permits the owner to perform emergency withdrawals of any ERC20 token. Reverts on zero address or zero amount and emits `Withdrawn`.
 
 ## Events
 
-### `AirdropClaimed`
-
-```solidity
-event AirdropClaimed(address indexed user, uint256 amount)
-```
-
-**Description**: Emitted when a user successfully claims airdrop tokens.
-
-**Parameters**:
-- `user` (address, indexed): The address that claimed the airdrop
-- `amount` (uint256): The amount of tokens transferred
-
----
-
-### `AirdropClaimAndStake`
-
-```solidity
-event AirdropClaimAndStake(address indexed user, uint256 claimAMount, uint256 stakeAmount)
-```
-
-**Description**: Emitted when a user claims half the airdrop immediately and stakes the remaining share.
-
-**Parameters**:
-- `user` (address, indexed): The address that initiated the claim-and-stake flow
-- `claimAMount` (uint256): The portion of tokens transferred instantly (half of airdrop)
-- `stakeAmount` (uint256): The portion of tokens locked for staking (half of airdrop)
-
----
+- `AirdropClaimed(address indexed user, uint256 amount, bool wantsToStake)`
+- `Staked(address indexed user, uint256 stakeAmount, uint256 unlockTime)`
+- `Unstaked(address indexed user, uint256 totalAmount)`
+- `Withdrawn(address indexed token, uint256 amount)`
 
 ## Custom Errors
 
-### `NotEligibaleForClaim()`
-
-**Description**: Thrown when a caller attempts to claim without being eligible.
-
-**Triggered by**: `claim()`, `claimHalfAndStake()`
-
----
-
-### `AlreadyClaimed()`
-
-**Description**: Thrown when a caller attempts to claim again after already claiming.
-
-**Triggered by**: `claim()`, `claimHalfAndStake()`, `claimStakeRewards()`
-
----
-
-### `AlreadyStaked()`
-
-**Description**: Thrown when a caller attempts to stake again or has an active staking period.
-
-**Triggered by**: `claim()`, `claimHalfAndStake()`
-
----
-
-### `NotStaked()`
-
-**Description**: Thrown when a caller attempts to claim staking rewards without having staked.
-
-**Triggered by**: `claimStakeRewards()`
-
----
-
-### `CanNotClaimNow()`
-
-**Description**: Thrown when a caller attempts to claim staking rewards before the staking duration has elapsed.
-
-**Triggered by**: `claimStakeRewards()`
-
----
+- `NotEligibaleForClaim()`
+- `AlreadyClaimed()`
+- `AlreadyStaked()`
+- `AlreadyUnstaked()`
+- `DoesNotWantToStake()`
+- `NotClaimed()`
+- `NotStaked()`
+- `CanNotUnstakeNow()`
+- `ZeroAddress()`
+- `ZeroAmount()`
 
 ## Usage Flow
 
-### Standard Claim Flow
+1. **Owner setup**  
+   - Call `setEligibaleForClaim()` with the list of addresses allowed to participate.
+   - Fund the contract with enough tokens to cover all expected claims and rewards.
+2. **User claim**  
+   - Eligible user calls `claim(true)` to opt into staking, or `claim(false)` to skip it.
+   - User immediately receives `airdropAmount / 2`.
+3. **If staking**  
+   - User calls `stake()` to start the 24-hour lock and be counted toward staking totals.
+   - After the unlock time, user calls `unstake()` to receive `airdropAmount` (locked half + reward half).
+4. **If not staking**  
+   - No further interaction is needed after `claim(false)`; the user only receives half the allocation and forgoes the reward.
 
-1. Owner calls `setEligibaleForClaim()` to whitelist addresses
-2. Eligible user calls `claim()` to receive full airdrop immediately
-3. User receives `airdropAmount` tokens
+## Operational Notes
 
-### Staking Flow
-
-1. Owner calls `setEligibaleForClaim()` to whitelist addresses
-2. Eligible user calls `claimHalfAndStake()` to:
-   - Receive `airdropAmount / 2` tokens immediately
-   - Lock remaining `airdropAmount / 2` for 1 day
-3. After 1 day, user calls `claimStakeRewards()` to receive:
-   - The remaining `airdropAmount / 2` (staked portion)
-   - Reward of `airdropAmount / 2` (equal to the staked amount)
-   - Total: `airdropAmount` tokens
-
-## Important Notes
-
-1. **One-Time Claim**: Each address can only claim once, either via `claim()` or `claimStakeRewards()` after staking
-2. **Staking Duration**: Fixed at 1 day (86400 seconds)
-3. **Staking Reward**: Users who stake receive double the amount (100% reward) after the staking period
-4. **Eligibility**: Addresses must be whitelisted by the owner before they can claim
-5. **Token Balance**: The contract must have sufficient token balance to fulfill all claims
-6. **Owner Privileges**: The owner can withdraw tokens at any time, so ensure trust in the owner
-
+- Each address can claim only once. Staking is optional but must be signaled at claim time.
+- Unstaking becomes available exactly 24 hours after `stake()`.
+- Ensure the contract maintains sufficient token reserves to fulfill both immediate transfers and future unstake payouts.
+- Owner withdrawals should only occur when excess tokens remain; withdrawing active staking liquidity risks failed unstake calls.
 
 ## Usage
 
-### Build
-
 ```shell
-$ forge build
-```
-
-### Test
-
-```shell
-$ forge test
+forge build
+forge test
 ```
 
 ## License
